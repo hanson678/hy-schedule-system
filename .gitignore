@@ -5,3 +5,4 @@ exports/
 data/ops.log
 *.bak
 ~$*
+dist/

@@ -122,6 +122,12 @@ async function checkStatus() {
         const status = document.getElementById('file-status');
         if (data.exists) {
             status.innerHTML = `<span class="text-success"><i class="bi bi-check-circle"></i> ${data.file_count}个排期文件 | ${data.item_count}个货号已索引</span>`;
+        } else if (!data.dir) {
+            status.innerHTML = `<span class="text-warning"><i class="bi bi-exclamation-triangle"></i> 首次使用，请先设置排期目录</span>`;
+            // 首次使用自动弹窗引导
+            setTimeout(() => {
+                if (confirm('检测到尚未设置排期目录，是否现在设置？')) changeDir();
+            }, 500);
         } else {
             status.innerHTML = `<span class="text-danger"><i class="bi bi-x-circle"></i> 目录不存在</span>`;
         }
