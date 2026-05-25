@@ -30,6 +30,7 @@ COL = {
 BLUE_COM = 15773696  # RGB(0,176,240)
 
 # 加载AutoFilter补丁（WPS文件兼容）
+import openpyxl
 import openpyxl.descriptors.base as _db
 _orig_mp_set = _db.MatchPattern.__set__
 def _lenient_mp_set(self, instance, value):
@@ -103,9 +104,9 @@ def _pick_target_sheets(sheet_names):
 
     规则：
     1. 优先：含"修改"且非辅助的 sheet → 全部返回（兼容现有命名约定）
-    2. 兜底：排除辅助 sheet 后，如果只剩一个候选 → 返回这一个
-       （覆盖 92120 这类没有"修改"sheet 的文件）
-    3. 否则返回空列表（保守策略，避免误写多候选文件）
+    2. 兜底：排除辅助 sheet 后，返回所有非辅助候选
+       （覆盖一个文件多个产品排期sheet的情况，如 7169+7170）
+    3. 全部是辅助 sheet → 返回空列表
     """
     if not sheet_names:
         return []
@@ -115,12 +116,12 @@ def _pick_target_sheets(sheet_names):
     if mod_sheets:
         return mod_sheets
 
-    # 2. 非辅助 sheet 只剩一个 → 用它
+    # 2. 非辅助 sheet → 全部返回（覆盖一个文件多个产品排期sheet的情况）
     non_aux = [s for s in sheet_names if not _is_aux_sheet(s)]
-    if len(non_aux) == 1:
+    if non_aux:
         return non_aux
 
-    # 3. 无法判定
+    # 3. 全部是辅助sheet
     return []
 
 
@@ -468,12 +469,13 @@ def analyze_orders(schedule_dir, orders):
             # Step 2: 货号映射查找（拷贝防止污染item_map）
             candidates = list(item_map.get(item_upper, []))
             if not candidates:
-                # 前缀兜底
-                base = re.match(r'(\d+[A-Za-z]*\d*)', item_upper)
-                if base:
+                # 前缀兜底：提取SKU中的所有数字串，与item_map key的纯数字前缀比对
+                # 例: 92121B-S002→['92121']  MEC489-15784-S001→['489','15784']
+                embedded_nums = re.findall(r'\d+', item_upper)
+                for num in embedded_nums:
                     for k, v in item_map.items():
-                        k_base = re.match(r'(\d+[A-Za-z]*\d*)', k)
-                        if k_base and k_base.group(1) == base.group(1):
+                        k_base = re.match(r'(\d+)', k)
+                        if k_base and k_base.group(1) == num:
                             for cand in v:
                                 if cand not in candidates:
                                     candidates.append(cand)
@@ -491,12 +493,32 @@ def analyze_orders(schedule_dir, orders):
                     'file': candidates[0]['file'], 'sheet': candidates[0]['sheet'],
                 })
             else:
-                # 多文件 → 待用户选择
-                ambiguous.append({
-                    'order_idx': oi, 'line_idx': li,
-                    'item': sku_spec, 'po': po,
-                    'candidates': candidates,
-                })
+                # 多候选 → 先尝试用货号数字前缀自动匹配sheet名
+                prefix_m = re.match(r'(\d+)', item_upper)
+                prefixes = [prefix_m.group(1)] if prefix_m else []
+                # 字母开头SKU：提取所有嵌入数字串作为候选前缀
+                if not prefixes:
+                    prefixes = re.findall(r'\d+', item_upper)
+                auto_match = None
+                for prefix in prefixes:
+                    matched = [c for c in candidates if prefix in c['sheet']]
+                    unique_targets = set((c['file'], c['sheet']) for c in matched)
+                    if len(unique_targets) == 1:
+                        auto_match = matched[0]
+                        break
+
+                if auto_match:
+                    new_lines.append({
+                        'order_idx': oi, 'line_idx': li,
+                        'item': sku_spec, 'po': po,
+                        'file': auto_match['file'], 'sheet': auto_match['sheet'],
+                    })
+                else:
+                    ambiguous.append({
+                        'order_idx': oi, 'line_idx': li,
+                        'item': sku_spec, 'po': po,
+                        'candidates': candidates,
+                    })
 
     return {
         'modifications': modifications,
@@ -774,7 +796,7 @@ def write_orders(schedule_dir, orders, ambiguous_selections=None, export_dir=Non
 
     export_file = ''
     if new_rows and export_dir:
-        export_file = _generate_new_excel(new_rows, export_dir)
+        export_file = _generate_new_excel(new_rows, export_dir, schedule_dir=schedule_dir)
 
     # 真正的新单数 = total - unknown(区分统计)
     real_new_count = len(new_rows) - unknown_count
@@ -797,34 +819,12 @@ def write_orders(schedule_dir, orders, ambiguous_selections=None, export_dir=Non
     }
 
 
-def _gen_sheet_name(file_name, existing):
-    """从排期文件名生成简短sheet名
-    规则：去年份/ZURU/生产排期通用词,保留货号+产品名,截断31字符,去重
-    """
-    base = str(file_name)
-    # 去扩展名(可能有 .xlsx新.xlsx 这种奇葩后缀)
-    base = re.sub(r'\.xlsx?(新)?\.xlsx?$', '', base, flags=re.IGNORECASE)
-    base = re.sub(r'\.xlsx?$', '', base, flags=re.IGNORECASE)
-    # 去年份前缀
-    base = re.sub(r'^2026[年\s]*', '', base)
-    # 去 ZURU 标识
-    base = re.sub(r'ZURU\s*', '', base, flags=re.IGNORECASE)
-    # 去"生产排期/排期表/排期"通用词
-    base = re.sub(r'生产排期|排期表|排期', '', base)
-    # #Fuggler# → Fuggler
-    base = re.sub(r'#Fuggler#', 'Fuggler', base, flags=re.IGNORECASE)
-    # (HY) → HY
-    base = re.sub(r'[（(]\s*HY\s*[)）]', 'HY', base, flags=re.IGNORECASE)
-    # 先去括号数字 (3)(1)(6)(2) 等
-    base = re.sub(r'\(\s*\d+\s*\)', '', base)
-    # 再去尾部日期 4-4 / 3-2 等
-    base = re.sub(r'\s*\d{1,2}-\d{1,2}\s*\.*\s*$', '', base)
-    # 去括号残留（去日期后可能暴露新括号）
-    base = re.sub(r'\(\s*\d+\s*\)', '', base)
+def _gen_sheet_name(name, existing):
+    """生成Excel sheet名：去禁用字符,截断31字符,去重"""
+    base = str(name).strip()
     # Excel sheet 名禁用字符
     base = re.sub(r'[\\/?*\[\]:]', '', base)
-    # 折叠多余空白
-    base = re.sub(r'\s+', '', base).strip('-_ ')
+    base = base.strip()
     if not base:
         base = 'Sheet'
     # 截断到 31 字符
@@ -840,7 +840,105 @@ def _gen_sheet_name(file_name, existing):
     return base
 
 
-def _generate_new_excel(new_rows, output_dir):
+def _read_formula_patterns(schedule_dir, target_file):
+    """从排期文件读取金额、总箱、单价列的公式模板。
+
+    不依赖固定列号，而是通过表头关键词动态定位：
+    - 金额列：表头含"金额"且不含"报"
+    - 单价列：金额列的前一列
+    - 总箱列：表头含"总箱"
+
+    Returns: {
+        'amount': '=I{ROW}*AA{ROW}' or None,
+        'total_box': '=I{ROW}/K{ROW}' or None,
+        'price': '=VLOOKUP(G{ROW},...)' or None,
+    }
+    """
+    result = {'amount': None, 'total_box': None, 'price': None}
+    if not schedule_dir or not target_file:
+        return result
+    fp = os.path.join(schedule_dir, target_file)
+    if not os.path.exists(fp):
+        return result
+    try:
+        wb = openpyxl.load_workbook(fp, read_only=True, data_only=False)
+    except Exception:
+        return result
+    try:
+        targets = _pick_target_sheets(wb.sheetnames)
+        for sn in targets:
+            ws = wb[sn]
+            # 找表头行
+            hdr_row = None
+            for r in range(1, 8):
+                for c in range(1, 40):
+                    if '产品货号' in str(ws.cell(r, c).value or ''):
+                        hdr_row = r
+                        break
+                if hdr_row:
+                    break
+            if not hdr_row:
+                continue
+
+            # 动态定位列：扫描表头
+            amount_col = None
+            total_box_col = None
+            for c in range(14, 40):
+                h = str(ws.cell(hdr_row, c).value or '').replace('\n', ' ')
+                if '金额' in h and '报' not in h and not amount_col:
+                    amount_col = c
+                if '总箱' in h and not total_box_col:
+                    total_box_col = c
+
+            first_data = hdr_row + 1
+            # 安全的行号替换：只匹配单元格引用中的行号（$?列字母+行号），
+            # 避免误替换 Sheet3! 等名称中的数字
+            _row_re = re.compile(
+                r'(\$?[A-Z]{1,3})\$?' + str(first_data) + r'(?!\d)')
+            _row_repl = r'\1{ROW}'
+
+            def _to_pattern(val):
+                if isinstance(val, str) and val.startswith('='):
+                    return _row_re.sub(_row_repl, val)
+                return None
+
+            # 读取金额公式（扫描几行兜底，第一行可能为空）
+            if amount_col:
+                for probe in range(first_data, min(first_data + 5, 100)):
+                    p = _to_pattern(ws.cell(probe, amount_col).value)
+                    if p:
+                        result['amount'] = p
+                        break
+
+            # 读取单价公式（金额列的前一列，需验证表头）
+            if amount_col:
+                price_col = amount_col - 1
+                for probe in range(first_data, min(first_data + 5, 100)):
+                    p = _to_pattern(ws.cell(probe, price_col).value)
+                    if p:
+                        result['price'] = p
+                        break
+
+            # 读取总箱公式
+            if total_box_col:
+                for probe in range(first_data, min(first_data + 5, 100)):
+                    p = _to_pattern(ws.cell(probe, total_box_col).value)
+                    if p:
+                        result['total_box'] = p
+                        break
+
+            # 只要找到一个sheet就够了
+            if any(result.values()):
+                break
+
+    except Exception as e:
+        logging.warning(f'[河源] 读取公式模板失败 {target_file}: {e}')
+    finally:
+        wb.close()
+    return result
+
+
+def _generate_new_excel(new_rows, output_dir, schedule_dir=None):
     """生成新单Excel:按目标文件分组为多个sheet,每sheet列布局严格对应真实排期 C1~C28
     C1-C14 数据列 | C15-C24 空白(跟踪列) | C25-C28 备注/跟单/单价/金额
     用户直接选数据行复制粘贴到排期对应位置,列自动对齐,公式相对引用自动跟随
@@ -900,14 +998,14 @@ def _generate_new_excel(new_rows, output_dir):
 
     DATE_KEYS = {'po_date', 'ship_date', 'insp_date'}
 
-    # 按目标文件分组,保持首次出现顺序
-    rows_by_file = OrderedDict()
+    # 按目标sheet分组（同一文件的不同sheet分开），保持首次出现顺序
+    rows_by_sheet = OrderedDict()
     for row in new_rows:
-        tf = row.get('target_file', '未知文件')
-        rows_by_file.setdefault(tf, []).append(row)
+        ts = row.get('target_sheet') or row.get('target_file', '未知文件')
+        rows_by_sheet.setdefault(ts, []).append(row)
 
     # 空列表早退,避免 wb.save 崩溃(至少需要1个可见sheet)
-    if not rows_by_file:
+    if not rows_by_sheet:
         return ''
 
     wb = openpyxl.Workbook()
@@ -915,9 +1013,15 @@ def _generate_new_excel(new_rows, output_dir):
 
     existing_sheet_names = set()
     tab_idx = 0
-    for target_file, rows in rows_by_file.items():
-        is_unknown = (target_file == '未识别货号')
-        sheet_name = _gen_sheet_name(target_file, existing_sheet_names)
+    for target_sheet, rows in rows_by_sheet.items():
+        is_unknown = (target_sheet == '未识别货号')
+        is_mod = (target_sheet == '修改单')
+        # 从排期文件动态读取金额/总箱/单价公式模板（用第一行的target_file）
+        target_file = rows[0].get('target_file', '')
+        patterns = {'amount': None, 'total_box': None, 'price': None}
+        if schedule_dir and not is_unknown and not is_mod:
+            patterns = _read_formula_patterns(schedule_dir, target_file)
+        sheet_name = _gen_sheet_name(target_sheet, existing_sheet_names)
         existing_sheet_names.add(sheet_name)
         ws = wb.create_sheet(title=sheet_name)
         # 未识别 sheet 强制纯红色标签以警示;其他 sheet 循环色
@@ -957,11 +1061,21 @@ def _generate_new_excel(new_rows, output_dir):
                     cell.border = thin
                     continue
                 val = row_data.get(key, '')
-                # 公式占位符替换:列位置=真实排期,直接用固定列字母 I/K/AA
+                # 公式占位符替换：优先用排期文件的真实公式模板，
+                # 否则用默认公式（=I/K 和 =AA*I）
                 if val == '__FORMULA_TOTAL_BOX__':
-                    val = f'=I{ri}/K{ri}'
+                    if patterns['total_box']:
+                        val = patterns['total_box'].replace('{ROW}', str(ri))
+                    else:
+                        val = f'=I{ri}/K{ri}'
                 elif val == '__FORMULA_AMOUNT__':
-                    val = f'=AA{ri}*I{ri}'
+                    if patterns['amount']:
+                        val = patterns['amount'].replace('{ROW}', str(ri))
+                    else:
+                        val = f'=AA{ri}*I{ri}'
+                # 单价列:排期有公式(如VLOOKUP)则复制公式并替换行号
+                if key == 'price' and patterns['price'] and val:
+                    val = patterns['price'].replace('{ROW}', str(ri))
                 cell = ws.cell(row=ri, column=ci, value=val)
                 cell.font = Font(name='宋体', size=11, color='000000')
                 cell.fill = blue_fill
@@ -981,5 +1095,5 @@ def _generate_new_excel(new_rows, output_dir):
     out_path = os.path.join(output_dir, fname)
     wb.save(out_path)
     wb.close()
-    logging.info(f'[河源新单Excel] {out_path},{len(rows_by_file)}个sheet,{len(new_rows)}行')
+    logging.info(f'[河源新单Excel] {out_path},{len(rows_by_sheet)}个sheet,{len(new_rows)}行')
     return fname
